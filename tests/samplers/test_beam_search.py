@@ -1,11 +1,8 @@
 """Compare the outputs of HF and vLLM when using beam search.
 
-Run `pytest tests/samplers/test_beam_search.py`.
+Run `pytest tests/samplers/test_beam_search.py --forked`.
 """
-import gc
-
 import pytest
-import torch
 
 # FIXME(zhuohan): The test can not pass if we:
 #   1. Increase max_tokens to 256.
@@ -29,7 +26,6 @@ def test_beam_search_single_input(
     max_tokens: int,
     beam_width: int,
 ) -> None:
-    example_prompts = example_prompts[:1]
     hf_model = hf_runner(model, dtype=dtype)
     hf_outputs = hf_model.generate_beam_search(example_prompts, beam_width,
                                                max_tokens)
@@ -39,10 +35,6 @@ def test_beam_search_single_input(
     vllm_outputs = vllm_model.generate_beam_search(example_prompts, beam_width,
                                                    max_tokens)
     del vllm_model
-    # NOTE(woosuk): For some reason, the following GC is required to avoid
-    # GPU OOM errors in the following tests using `vllm_runner`.
-    gc.collect()
-    torch.cuda.empty_cache()
 
     for i in range(len(example_prompts)):
         hf_output_ids, _ = hf_outputs[i]

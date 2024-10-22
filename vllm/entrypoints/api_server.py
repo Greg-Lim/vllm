@@ -1,35 +1,21 @@
-"""
-NOTE: This API server is used only for demonstrating usage of AsyncEngine
-and simple performance benchmarks. It is not intended for production use.
-For production use, we recommend using our OpenAI compatible server.
-We are also not going to accept PRs modifying this file, please
-change `vllm/entrypoints/openai/api_server.py` instead.
-"""
-
 import argparse
 import json
-import ssl
 from typing import AsyncGenerator
 
-import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+import uvicorn
 
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.async_llm_engine import AsyncLLMEngine
 from vllm.sampling_params import SamplingParams
-from vllm.usage.usage_lib import UsageContext
 from vllm.utils import random_uuid
 
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
+TIMEOUT_TO_PREVENT_DEADLOCK = 1  # seconds.
 app = FastAPI()
 engine = None
-
-
-@app.get("/health")
-async def health() -> Response:
-    """Health check."""
-    return Response(status_code=200)
+import base64, json
 
 
 @app.post("/generate")
@@ -43,12 +29,19 @@ async def generate(request: Request) -> Response:
     """
     request_dict = await request.json()
     prompt = request_dict.pop("prompt")
+    prompt_token_ids = None
     stream = request_dict.pop("stream", False)
     sampling_params = SamplingParams(**request_dict)
-    request_id = random_uuid()
+    request_id = request_dict.pop("request_id", None)
+    if not request_id:
+        request_id = random_uuid()
+    
+    dummy_token_ids = request_dict.pop("dummy_token_ids", False)
+    if dummy_token_ids:
+        prompt_token_ids = [0] * int(prompt)
+        prompt = None
 
-    assert engine is not None
-    results_generator = engine.generate(prompt, sampling_params, request_id)
+    results_generator = engine.generate(prompt, sampling_params, request_id, prompt_token_ids)
 
     # Streaming case
     async def stream_results() -> AsyncGenerator[bytes, None]:
@@ -78,42 +71,42 @@ async def generate(request: Request) -> Response:
     ret = {"text": text_outputs}
     return JSONResponse(ret)
 
+@app.post("/resume")
+async def resume(request: Request) -> Response:
+    request_dict = await request.json()
+    request_id = request_dict.pop("request_id")
+    api_return_length = request_dict.pop("api_return_length")
+    api_return_tokens = [0] * api_return_length
+
+    results_generator = engine.resume_request_single(request_id, api_return_tokens)
+
+    # Non-streaming case
+    final_output = None
+    async for request_output in results_generator:
+        if await request.is_disconnected():
+            # Abort the request if the client disconnects.
+            await engine.abort(request_id)
+            return Response(status_code=499)
+        final_output = request_output
+
+    assert final_output is not None
+    prompt = final_output.prompt
+    text_outputs = [prompt + output.text for output in final_output.outputs]
+    ret = {"text": text_outputs}
+    return JSONResponse(ret)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--host", type=str, default=None)
+    parser.add_argument("--host", type=str, default="localhost")
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--ssl-keyfile", type=str, default=None)
-    parser.add_argument("--ssl-certfile", type=str, default=None)
-    parser.add_argument("--ssl-ca-certs",
-                        type=str,
-                        default=None,
-                        help="The CA certificates file")
-    parser.add_argument(
-        "--ssl-cert-reqs",
-        type=int,
-        default=int(ssl.CERT_NONE),
-        help="Whether client certificate is required (see stdlib ssl module's)"
-    )
-    parser.add_argument(
-        "--root-path",
-        type=str,
-        default=None,
-        help="FastAPI root_path when app is behind a path based routing proxy")
-    parser.add_argument("--log-level", type=str, default="debug")
     parser = AsyncEngineArgs.add_cli_args(parser)
     args = parser.parse_args()
-    engine_args = AsyncEngineArgs.from_cli_args(args)
-    engine = AsyncLLMEngine.from_engine_args(
-        engine_args, usage_context=UsageContext.API_SERVER)
 
-    app.root_path = args.root_path
+    engine_args = AsyncEngineArgs.from_cli_args(args)
+    engine = AsyncLLMEngine.from_engine_args(engine_args)
+
     uvicorn.run(app,
                 host=args.host,
                 port=args.port,
-                log_level=args.log_level,
-                timeout_keep_alive=TIMEOUT_KEEP_ALIVE,
-                ssl_keyfile=args.ssl_keyfile,
-                ssl_certfile=args.ssl_certfile,
-                ssl_ca_certs=args.ssl_ca_certs,
-                ssl_cert_reqs=args.ssl_cert_reqs)
+                log_level="debug",
+                timeout_keep_alive=TIMEOUT_KEEP_ALIVE)

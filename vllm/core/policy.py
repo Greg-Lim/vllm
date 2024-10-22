@@ -1,5 +1,4 @@
-from collections import deque
-from typing import Deque
+from typing import List, Tuple
 
 from vllm.sequence import SequenceGroup
 
@@ -16,14 +15,13 @@ class Policy:
     def sort_by_priority(
         self,
         now: float,
-        seq_groups: Deque[SequenceGroup],
-    ) -> Deque[SequenceGroup]:
-        return deque(
-            sorted(
-                seq_groups,
-                key=lambda seq_group: self.get_priority(now, seq_group),
-                reverse=True,
-            ))
+        seq_groups: List[SequenceGroup],
+    ) -> List[SequenceGroup]:
+        return sorted(
+            seq_groups,
+            key=lambda seq_group: self.get_priority(now, seq_group),
+            reverse=True,
+        )
 
 
 class FCFS(Policy):
@@ -33,12 +31,33 @@ class FCFS(Policy):
         now: float,
         seq_group: SequenceGroup,
     ) -> float:
-        return now - seq_group.metrics.arrival_time
+        return now - seq_group.arrival_time
+    
+class Chunked_FCFS(Policy):
 
+    def get_priority(
+        self,
+        now: float,
+        seq_group: SequenceGroup,
+    ) -> Tuple[int, float]:
+        return -seq_group.get_seqs()[0].data.logical_query_len, now - seq_group.arrival_time
+
+class LongestRemainingAPIFirst(Policy):
+
+    def get_priority(
+        self,
+        now: float,
+        seq_group: SequenceGroup,
+    ) -> float:
+        return seq_group.api_remaining_time(now)
 
 class PolicyFactory:
 
-    _POLICY_REGISTRY = {'fcfs': FCFS}
+    _POLICY_REGISTRY = {
+        'fcfs': FCFS,
+        'c-fcfs': Chunked_FCFS,
+        'lra': LongestRemainingAPIFirst,
+    }
 
     @classmethod
     def get_policy(cls, policy_name: str, **kwargs) -> Policy:

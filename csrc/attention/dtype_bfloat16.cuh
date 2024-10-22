@@ -21,17 +21,8 @@
 #include "attention_generic.cuh"
 #include "dtype_float32.cuh"
 
-#ifndef USE_ROCM
-  #include <cuda_bf16.h>
-  #include <cuda_fp16.h>
-#else
-  #include <hip/hip_bf16.h>
-  #include <hip/hip_fp16.h>
-
-  typedef __hip_bfloat162 __nv_bfloat162;
-  typedef __hip_bfloat16 __nv_bfloat16;
-#endif
-
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <stdint.h>
 
 namespace vllm {
@@ -107,11 +98,7 @@ inline __device__ __nv_bfloat16 add(__nv_bfloat16 a, __nv_bfloat16 b) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
   assert(false);
 #else
-  #ifndef USE_ROCM
-    return a + b;
-  #else
-    return __hadd(a, b);
-  #endif
+  return a + b;
 #endif
 }
 
@@ -431,11 +418,6 @@ inline __device__ void from_float(bf16_8_t& dst, Float8_ src) {
   dst.z = __float22bfloat162_rn(src.z);
   dst.w = __float22bfloat162_rn(src.w);
 #endif
-}
-
-// From bfloat16 to float32.
-inline __device__ float to_float(__nv_bfloat16 u) {
-  return __bfloat162float(u);
 }
 
 // Zero-out a variable.

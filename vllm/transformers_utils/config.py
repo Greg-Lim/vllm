@@ -1,30 +1,34 @@
-from typing import Dict, Optional
+from typing import Optional
 
 from transformers import AutoConfig, PretrainedConfig
 
-from vllm.transformers_utils.configs import (ChatGLMConfig, DbrxConfig,
-                                             JAISConfig, MPTConfig, RWConfig)
+from vllm.transformers_utils.configs import *  # pylint: disable=wildcard-import
 
-_CONFIG_REGISTRY: Dict[str, PretrainedConfig] = {
-    "chatglm": ChatGLMConfig,
-    "dbrx": DbrxConfig,
+_CONFIG_REGISTRY = {
     "mpt": MPTConfig,
+    "baichuan": BaiChuanConfig,
+    "aquila": AquilaConfig,
+    "qwen": QWenConfig,
     "RefinedWeb": RWConfig,  # For tiiuae/falcon-40b(-instruct)
     "RefinedWebModel": RWConfig,  # For tiiuae/falcon-7b(-instruct)
-    "jais": JAISConfig,
 }
 
 
 def get_config(model: str,
                trust_remote_code: bool,
-               revision: Optional[str] = None,
-               code_revision: Optional[str] = None) -> PretrainedConfig:
+               revision: Optional[str] = None) -> PretrainedConfig:
+    # NOTE: Because the Mistral model in HF hub does not have
+    # `configuration_mistral.py`, we cannot use `AutoConfig` to load the
+    # config. Instead, we use `MistralConfig` directly.
+    # NOTE: This is a hack. This does not work for local models.
+    # FIXME: Remove this once the Mistral model is available in the stable
+    # version of HF transformers.
+    if "mistral" in model.lower():
+        return MistralConfig.from_pretrained(model, revision=revision)
+
     try:
         config = AutoConfig.from_pretrained(
-            model,
-            trust_remote_code=trust_remote_code,
-            revision=revision,
-            code_revision=code_revision)
+            model, trust_remote_code=trust_remote_code, revision=revision)
     except ValueError as e:
         if (not trust_remote_code and
                 "requires you to execute the configuration file" in str(e)):
@@ -38,21 +42,5 @@ def get_config(model: str,
             raise e
     if config.model_type in _CONFIG_REGISTRY:
         config_class = _CONFIG_REGISTRY[config.model_type]
-        config = config_class.from_pretrained(model,
-                                              revision=revision,
-                                              code_revision=code_revision)
+        config = config_class.from_pretrained(model, revision=revision)
     return config
-
-
-def get_hf_text_config(config: PretrainedConfig):
-    """Get the "sub" config relevant to llm for multi modal models.
-        No op for pure text models.
-    """
-    if hasattr(config, "text_config"):
-        # The code operates under the assumption that text_config should have
-        # `num_attention_heads` (among others). Assert here to fail early
-        # if transformers config doesn't align with this assumption.
-        assert hasattr(config.text_config, "num_attention_heads")
-        return config.text_config
-    else:
-        return config
