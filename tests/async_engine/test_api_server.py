@@ -8,11 +8,11 @@ import pytest
 import requests
 
 
-def _query_server(prompt: str, max_tokens: int = 5) -> dict:
+def _query_server(prompt: str) -> dict:
     response = requests.post("http://localhost:8000/generate",
                              json={
                                  "prompt": prompt,
-                                 "max_tokens": max_tokens,
+                                 "max_tokens": 100,
                                  "temperature": 0,
                                  "ignore_eos": True
                              })
@@ -20,32 +20,21 @@ def _query_server(prompt: str, max_tokens: int = 5) -> dict:
     return response.json()
 
 
-def _query_server_long(prompt: str) -> dict:
-    return _query_server(prompt, max_tokens=500)
-
-
 @pytest.fixture
-def api_server(tokenizer_pool_size: int, worker_use_ray: bool):
+def api_server():
     script_path = Path(__file__).parent.joinpath(
         "api_server_async_engine.py").absolute()
-    commands = [
+    # pylint: disable=consider-using-with
+    uvicorn_process = subprocess.Popen([
         sys.executable, "-u",
-        str(script_path), "--model", "facebook/opt-125m", "--host",
-        "127.0.0.1", "--tokenizer-pool-size",
-        str(tokenizer_pool_size)
-    ]
-
-    if worker_use_ray:
-        commands.append("--worker-use-ray")
-    uvicorn_process = subprocess.Popen(commands)
+        str(script_path), "--model", "facebook/opt-125m"
+    ])
     yield
     uvicorn_process.terminate()
 
 
-@pytest.mark.parametrize("tokenizer_pool_size", [0, 2])
-@pytest.mark.parametrize("worker_use_ray", [False, True])
-def test_api_server(api_server, tokenizer_pool_size: int,
-                    worker_use_ray: bool):
+# pylint: disable=redefined-outer-name, unused-argument
+def test_api_server(api_server):
     """
     Run the API server and test it.
 
@@ -57,14 +46,14 @@ def test_api_server(api_server, tokenizer_pool_size: int,
     """
     with Pool(32) as pool:
         # Wait until the server is ready
-        prompts = ["warm up"] * 1
+        prompts = ["Hello world"] * 1
         result = None
         while not result:
+            # pylint: disable=bare-except
             try:
-                for r in pool.map(_query_server, prompts):
-                    result = r
+                for result in pool.map(_query_server, prompts):
                     break
-            except requests.exceptions.ConnectionError:
+            except:
                 time.sleep(1)
 
         # Actual tests start here
@@ -77,22 +66,17 @@ def test_api_server(api_server, tokenizer_pool_size: int,
         assert num_aborted_requests == 0
 
         # Try with 100 prompts
-        prompts = ["test prompt"] * 100
+        prompts = ["Hello world"] * 100
         for result in pool.map(_query_server, prompts):
             assert result
 
-    with Pool(32) as pool:
         # Cancel requests
-        prompts = ["canceled requests"] * 100
-        pool.map_async(_query_server_long, prompts)
+        pool.map_async(_query_server, prompts)
         time.sleep(0.01)
         pool.terminate()
         pool.join()
 
         # check cancellation stats
-        # give it some times to update the stats
-        time.sleep(1)
-
         num_aborted_requests = requests.get(
             "http://localhost:8000/stats").json()["num_aborted_requests"]
         assert num_aborted_requests > 0
@@ -100,6 +84,6 @@ def test_api_server(api_server, tokenizer_pool_size: int,
     # check that server still runs after cancellations
     with Pool(32) as pool:
         # Try with 100 prompts
-        prompts = ["test prompt after canceled"] * 100
+        prompts = ["Hello world"] * 100
         for result in pool.map(_query_server, prompts):
             assert result

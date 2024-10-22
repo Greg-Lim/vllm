@@ -1,61 +1,61 @@
 """A block manager that manages token blocks."""
-from typing import Dict, List, Optional
-from typing import Sequence as GenericSequence
-from typing import Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
-from vllm.core.block.block_table import BlockTable
-from vllm.core.block.cpu_gpu_block_allocator import CpuGpuBlockAllocator
-from vllm.core.block.interfaces import Block
-from vllm.core.block.prefix_caching_block import (ComputedBlocksTracker,
-                                                  LastAccessBlocksTracker)
-from vllm.core.block.utils import check_no_caching_or_swa_for_blockmgr_encdec
-from vllm.core.interfaces import AllocStatus, BlockSpaceManager
+from vllm.block import PhysicalTokenBlock
 from vllm.sequence import Sequence, SequenceGroup, SequenceStatus
 from vllm.utils import Device
 
-SeqId = int
-EncoderSeqId = str
 
+class BlockAllocator:
+    """Manages free physical token blocks for a device.
 
-class SelfAttnBlockSpaceManager(BlockSpaceManager):
-    """BlockSpaceManager which manages the allocation of KV cache.
-
-    It owns responsibility for allocation, swapping, allocating memory for
-    autoregressively-generated tokens, and other advanced features such as
-    prefix caching, forking/copy-on-write, and sliding-window memory allocation.
-
-    This class implements the design described in
-    https://github.com/vllm-project/vllm/pull/3492.
-
-    Lookahead slots
-        The block manager has the notion of a "lookahead slot". These are slots
-        in the KV cache that are allocated for a sequence. Unlike the other
-        allocated slots, the content of these slots is undefined -- the worker
-        may use the memory allocations in any way.
-
-        In practice, a worker could use these lookahead slots to run multiple
-        forward passes for a single scheduler invocation. Each successive
-        forward pass would write KV activations to the corresponding lookahead
-        slot. This allows low inter-token latency use-cases, where the overhead
-        of continuous batching scheduling is amortized over >1 generated tokens.
-
-        Speculative decoding uses lookahead slots to store KV activations of
-        proposal tokens.
-
-        See https://github.com/vllm-project/vllm/pull/3250 for more information
-        on lookahead scheduling.
-
-    Args:
-        block_size (int): The size of each memory block.
-        num_gpu_blocks (int): The number of memory blocks allocated on GPU.
-        num_cpu_blocks (int): The number of memory blocks allocated on CPU.
-        watermark (float, optional): The threshold used for memory swapping.
-            Defaults to 0.01.
-        sliding_window (Optional[int], optional): The size of the sliding
-            window. Defaults to None.
-        enable_caching (bool, optional): Flag indicating whether caching is
-            enabled. Defaults to False.
+    The allocator maintains a list of free blocks and allocates a block when
+    requested. When a block is freed, its reference count is decremented. If
+    the reference count becomes zero, the block is added back to the free list.
     """
+
+    def __init__(
+        self,
+        device: Device,
+        block_size: int,
+        num_blocks: int,
+    ) -> None:
+        self.device = device
+        self.block_size = block_size
+        self.num_blocks = num_blocks
+
+        # Initialize the free blocks.
+        self.free_blocks: List[PhysicalTokenBlock] = []
+        for i in range(num_blocks):
+            block = PhysicalTokenBlock(device=device,
+                                       block_number=i,
+                                       block_size=block_size)
+            self.free_blocks.append(block)
+
+    def allocate(self) -> PhysicalTokenBlock:
+        if not self.free_blocks:
+            raise ValueError("Out of memory! No free blocks are available.")
+        block = self.free_blocks.pop()
+        block.ref_count = 1
+        return block
+
+    def free(self, block: PhysicalTokenBlock) -> None:
+        if block.ref_count == 0:
+            raise ValueError(f"Double free! {block} is already freed.")
+        block.ref_count -= 1
+        if block.ref_count == 0:
+            self.free_blocks.append(block)
+
+    def get_num_free_blocks(self) -> int:
+        return len(self.free_blocks)
+
+
+# Mapping: logical block number -> physical block.
+BlockTable = List[PhysicalTokenBlock]
+
+
+class BlockSpaceManager:
+    """Manages the mapping between logical and physical token blocks."""
 
     def __init__(
         self,
@@ -64,442 +64,409 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         num_cpu_blocks: int,
         watermark: float = 0.01,
         sliding_window: Optional[int] = None,
-        enable_caching: bool = False,
     ) -> None:
         self.block_size = block_size
         self.num_total_gpu_blocks = num_gpu_blocks
         self.num_total_cpu_blocks = num_cpu_blocks
 
-        self.sliding_window = sliding_window
-        # max_block_sliding_window is the max number of blocks that need to be
-        # allocated
-        self.max_block_sliding_window = None
+        self.block_sliding_window = None
         if sliding_window is not None:
-            # +1 here because // rounds down
-            num_blocks = sliding_window // block_size + 1
-            # +1 here because the last block may not be full,
-            # and so the sequence stretches one more block at the beginning
-            # For example, if sliding_window is 3 and block_size is 4,
-            # we may need 2 blocks when the second block only holds 1 token.
-            self.max_block_sliding_window = num_blocks + 1
+            assert sliding_window % block_size == 0, (sliding_window,
+                                                      block_size)
+            self.block_sliding_window = sliding_window // block_size
 
         self.watermark = watermark
         assert watermark >= 0.0
 
-        self.enable_caching = enable_caching
-
         self.watermark_blocks = int(watermark * num_gpu_blocks)
+        self.gpu_allocator = BlockAllocator(Device.GPU, block_size,
+                                            num_gpu_blocks)
+        self.cpu_allocator = BlockAllocator(Device.CPU, block_size,
+                                            num_cpu_blocks)
+        # Mapping: seq_id -> BlockTable.
+        self.block_tables: Dict[int, BlockTable] = {}
+    
+    def token_2_block(self, tok: int) -> int:
+        return (tok + self.block_size - 1) // self.block_size
 
-        self.block_allocator = CpuGpuBlockAllocator.create(
-            allocator_type="prefix_caching" if enable_caching else "naive",
-            num_gpu_blocks=num_gpu_blocks,
-            num_cpu_blocks=num_cpu_blocks,
-            block_size=block_size,
-        )
-
-        self.block_tables: Dict[SeqId, BlockTable] = {}
-        self.cross_block_tables: Dict[EncoderSeqId, BlockTable] = {}
-
-        self._computed_blocks_tracker = ComputedBlocksTracker(
-            self.block_allocator)
-        self._last_access_blocks_tracker = LastAccessBlocksTracker(
-            self.block_allocator)
-
-    def can_allocate(self,
-                     seq_group: SequenceGroup,
-                     num_lookahead_slots: int = 0) -> AllocStatus:
+    def can_allocate(self, seq_group: SequenceGroup, inflight_tokens: int = -1) -> bool:
         # FIXME(woosuk): Here we assume that all sequences in the group share
         # the same prompt. This may not be true for preempted sequences.
-
-        check_no_caching_or_swa_for_blockmgr_encdec(self, seq_group)
-
-        seq = seq_group.get_seqs(status=SequenceStatus.WAITING)[0]
-        num_required_blocks = BlockTable.get_num_required_blocks(
-            seq.get_token_ids(),
-            block_size=self.block_size,
-            num_lookahead_slots=num_lookahead_slots,
-        )
-
-        if seq_group.is_encoder_decoder():
-            encoder_seq = seq_group.get_encoder_seq()
-            assert encoder_seq is not None
-            num_required_blocks += BlockTable.get_num_required_blocks(
-                encoder_seq.get_token_ids(),
-                block_size=self.block_size,
-            )
-
-        if self.max_block_sliding_window is not None:
-            num_required_blocks = min(num_required_blocks,
-                                      self.max_block_sliding_window)
-
-        num_free_gpu_blocks = self.block_allocator.get_num_free_blocks(
-            device=Device.GPU)
-
-        # Use watermark to avoid frequent cache eviction.
-        if (self.num_total_gpu_blocks - num_required_blocks <
-                self.watermark_blocks):
-            return AllocStatus.NEVER
-        if num_free_gpu_blocks - num_required_blocks >= self.watermark_blocks:
-            return AllocStatus.OK
+        seq = seq_group.get_seqs()[0]
+        if inflight_tokens == -1:
+            num_required_blocks = len(seq.logical_token_blocks)
         else:
-            return AllocStatus.LATER
-
-    def _allocate_sequence(self, seq: Sequence) -> BlockTable:
-        block_table = BlockTable(
-            block_size=self.block_size,
-            block_allocator=self.block_allocator,
-            max_block_sliding_window=self.max_block_sliding_window,
-        )
-        if seq.get_token_ids():
-            # Add blocks to the block table only if the sequence is non empty.
-            block_table.allocate(seq.get_token_ids())
-
-        return block_table
-
-    def allocate(self, seq_group: SequenceGroup) -> None:
-
-        # Allocate self-attention block tables for decoder sequences
-        waiting_seqs = seq_group.get_seqs(status=SequenceStatus.WAITING)
-        assert not (set(seq.seq_id for seq in waiting_seqs)
-                    & self.block_tables.keys()), "block table already exists"
-
+            num_required_blocks = self.token_2_block(inflight_tokens)
+        if self.block_sliding_window is not None:
+            num_required_blocks = min(num_required_blocks,
+                                      self.block_sliding_window)
+        num_free_gpu_blocks = self.gpu_allocator.get_num_free_blocks()
+        # Use watermark to avoid frequent cache eviction.
+        return (num_free_gpu_blocks - num_required_blocks >=
+                self.watermark_blocks)
+    
+    # NOTE: set workload before calling this function
+    #       this should be the unifined interface for querying memory needs
+    def get_memory_requirement(self, seq_group: SequenceGroup) -> int:
+        seq = seq_group.get_seqs()[0]
+        n_required_blocks = 0
+        """Get memory requirement for resuming discarded tokens"""
+        if seq.data.resume_discard_tokens:
+            n_required_blocks += seq.num_new_blocks_for_resume_discard
+        """Get memory requirement for resuming swapped tokens"""
+        if seq.data.resume_swap_blocks:
+            n_required_blocks += seq.num_new_blocks_for_resume_swap
+        """Get memory requirement for appending inflight tokens"""
+        if seq.data.running_inflight_tokens:
+            assert seq.data.discard_length - seq.data.resume_discard_tokens == 0
+            assert seq.data.swap_length - seq.data.resume_swap_blocks == 0
+            n_required_blocks += seq.num_new_blocks_for_inflight
+        return n_required_blocks
+    
+    # NOTE: populate workload before calling this function
+    # TODO: currently assume all or nothing
+    def allocate(self, seq_group: SequenceGroup, blocks_to_swap_in: Dict[int, int]) -> None:
         # NOTE: Here we assume that all sequences in the group have the same
         # prompt.
-        seq = waiting_seqs[0]
-        block_table: BlockTable = self._allocate_sequence(seq)
-        self.block_tables[seq.seq_id] = block_table
+        seq = seq_group.get_seqs()[0]
+        if seq.seq_id not in self.block_tables:
+            self.block_tables[seq.seq_id] = []   
+        block_table: BlockTable = self.block_tables[seq.seq_id]
+        
+        """Get memory requirement for resuming discarded tokens"""
+        if seq.data.resume_discard_tokens:
+            resumed_discard_blocks = self.token_2_block(seq.data.discard_start_idx)
+            for i in range(seq.num_new_blocks_for_resume_discard):
+                block = self.gpu_allocator.allocate()
+                block_table.insert(resumed_discard_blocks + i, block)
+                
+        """Get memory requirement for resuming swapped tokens"""
+        if seq.data.resume_swap_blocks:
+            n_swap_in = seq.num_new_blocks_for_resume_swap
+            mapping: Dict[PhysicalTokenBlock, PhysicalTokenBlock] = {}
+            for idx, block in enumerate(block_table):
+                if block.device == Device.GPU or n_swap_in == 0:
+                    continue
+                if block in mapping:
+                    mapping[block].ref_count += 1
+                else:
+                    gpu_block = self.gpu_allocator.allocate()
+                    mapping[block] = gpu_block
+                    block_table[idx] = gpu_block
+                    n_swap_in -= 1
+                self.cpu_allocator.free(block)
+            block_number_mapping = {
+                cpu_block.block_number: gpu_block.block_number
+                for cpu_block, gpu_block in mapping.items()
+            }
+            blocks_to_swap_in.update(block_number_mapping)
+            
+        """Get memory requirement for appending inflight tokens"""
+        if seq.data.running_inflight_tokens:
+            assert seq.data.discard_length - seq.data.resume_discard_tokens == 0
+            assert seq.data.swap_length - seq.data.resume_swap_blocks == 0
+            #TODO: if n > 1, add copy back
+            if self.block_sliding_window:
+                raise NotImplementedError("sliding window att not considered")
+            for _ in range(seq.num_new_blocks_for_inflight):
+                block = self.gpu_allocator.allocate()
+                block.ref_count = seq_group.num_seqs()
+                block_table.append(block)
 
-        # Track seq
-        self._computed_blocks_tracker.add_seq(seq.seq_id)
-        self._last_access_blocks_tracker.add_seq(seq.seq_id)
+    def can_append_slot(self, seq_group: SequenceGroup) -> bool:
+        # Simple heuristic: If there is at least one free block
+        # for each sequence, we can append.
+        num_free_gpu_blocks = self.gpu_allocator.get_num_free_blocks()
+        num_seqs = seq_group.num_seqs(status=SequenceStatus.RUNNING)
+        return num_seqs <= num_free_gpu_blocks
+    
+    # Calculate the new block that need to be allocated
+    # NOTE: inflight tokens represents the number of tokens that are forwarded to the model
+    def required_new_blocks(self, seq_group: SequenceGroup, inflight_tokens: int = -1) -> int:
+        seqs = seq_group.get_seqs()
+        assert len(seqs) == 1
+        r = 0
+        for seq in seqs:
+            physical_blocks = len(self.block_tables[seq.seq_id])
+            if inflight_tokens == -1:
+                logical_blocks = len(seq.logical_token_blocks)
+            else:
+                logical_blocks = seq.get_num_required_blocks_inflight(inflight_tokens)
+            r += max(0, logical_blocks - physical_blocks)
+        return r
 
-        # Assign the block table for each sequence.
-        for seq in waiting_seqs[1:]:
-            self.block_tables[seq.seq_id] = block_table.fork()
+    # Determine whether required number of new blocks can be fulfilled
+    def can_fulfill_blocks(self, r: int) -> bool:
+        num_free_gpu_blocks = self.gpu_allocator.get_num_free_blocks()
+        return r <= num_free_gpu_blocks
 
-            # Track seq
-            self._computed_blocks_tracker.add_seq(seq.seq_id)
-            self._last_access_blocks_tracker.add_seq(seq.seq_id)
+    # determine if last physical block is full
+    # state of last physical block == last logical block before appending the previous output token
+    # NOTE: this is used in def append_slot, which prepares the cache memory
+    # for output in the previous iteration
+    def is_last_physical_full(self, seq: Sequence) -> bool:
+        num_tks_to_cache = seq.data.logical_query_len
+        return (num_tks_to_cache % seq.block_size) == seq.logical_token_blocks[-1].num_tokens
 
-        # Allocate cross-attention block table for encoder sequence
-        #
-        # NOTE: Here we assume that all sequences in the group have the same
-        # encoder prompt.
-        request_id = seq_group.request_id
-
-        assert (request_id
-                not in self.cross_block_tables), \
-            "block table already exists"
-
-        check_no_caching_or_swa_for_blockmgr_encdec(self, seq_group)
-
-        if seq_group.is_encoder_decoder():
-            encoder_seq = seq_group.get_encoder_seq()
-            assert encoder_seq is not None
-            block_table = self._allocate_sequence(encoder_seq)
-            self.cross_block_tables[request_id] = block_table
-
-    def can_append_slots(self, seq_group: SequenceGroup,
-                         num_lookahead_slots: int) -> bool:
-        """Determine if there is enough space in the GPU KV cache to continue
-        generation of the specified sequence group.
-
-        We use a worst-case heuristic: assume each touched block will require a
-        new allocation (either via CoW or new block). We can append slots if the
-        number of touched blocks is less than the number of free blocks.
-
-        "Lookahead slots" are slots that are allocated in addition to the slots
-        for known tokens. The contents of the lookahead slots are not defined.
-        This is used by speculative decoding when speculating future tokens.
-        """
-
-        num_touched_blocks = 0
-        for seq in seq_group.get_seqs(status=SequenceStatus.RUNNING):
-            block_table = self.block_tables[seq.seq_id]
-
-            num_touched_blocks += (
-                block_table.get_num_blocks_touched_by_append_slots(
-                    token_ids=block_table.get_unseen_token_ids(
-                        seq.get_token_ids()),
-                    num_lookahead_slots=num_lookahead_slots,
-                ))
-
-        num_free_gpu_blocks = self.block_allocator.get_num_free_blocks(
-            Device.GPU)
-        return num_touched_blocks <= num_free_gpu_blocks
-
-    def append_slots(
-        self,
-        seq: Sequence,
-        num_lookahead_slots: int,
-    ) -> List[Tuple[int, int]]:
-
+    def append_slot(self, seq: Sequence) -> Optional[Tuple[int, int]]:
+        """Allocate a physical slot for a new token."""
+        num_logical_blocks = seq.num_new_blocks_for_inflight
         block_table = self.block_tables[seq.seq_id]
 
-        block_table.append_token_ids(
-            token_ids=block_table.get_unseen_token_ids(seq.get_token_ids()),
-            num_lookahead_slots=num_lookahead_slots,
-            num_computed_slots=seq.data.get_num_computed_tokens(),
-        )
-        # Return any new copy-on-writes.
-        new_cows = self.block_allocator.clear_copy_on_writes()
-        return new_cows
+        # NOTE: logical block can be appended by an API-resume, meaning
+        # the last physical block may not be full even we have new
+        # logical blocks, need to check copy target
+        copy_on_write_pairs = None
+        last_block = block_table[-1]
+        assert last_block.device == Device.GPU
+        # if last block is not full but shared with otherseq
+        if last_block.ref_count > 1 and not self.is_last_physical_full(seq):
+            # Copy on Write: Allocate a new block and copy the tokens.
+            new_block = self.gpu_allocator.allocate()
+            block_table[-1] = new_block
+            # Decrease ref_count only
+            self.gpu_allocator.free(last_block)
+            copy_on_write_pairs = (last_block.block_number,
+                                   new_block.block_number)
+        
+        # if len(block_table) < len(logical_blocks):
+        #     if (self.block_sliding_window
+        #             and len(block_table) >= self.block_sliding_window):
+        #         # re-use a block
+        #         block_table.append(block_table[len(block_table) %
+        #                                        self.block_sliding_window])
+        #     else:
+        #         # The sequence has a new logical block.
+        #         # Allocate a new physical block.
+        #         block = self.gpu_allocator.allocate()
+        #         block_table.append(block)
+        #         return None
+        if self.block_sliding_window:
+            raise NotImplementedError("sliding window att not considered")
+        while num_logical_blocks > len(block_table):
+            # The sequence has a new logical block.
+            # Allocate a new physical block.
+            block = self.gpu_allocator.allocate()
+            block_table.append(block)
 
-    def free(self, seq: Sequence) -> None:
-        seq_id = seq.seq_id
+        return copy_on_write_pairs
 
-        if seq_id not in self.block_tables:
-            # Already freed or haven't been scheduled yet.
-            return
+    # NOTE: this function will only allocate for discarded blocks right before swapped blocks, not for rear new tokens
+    def prepend_slot(self, seq: Sequence) -> None:
+        """Allocate a physical slot for discarded tokens"""
+        resumed_blocks = self.token_2_block(seq.discard_start_idx)
+        num_required_allocation = self.token_2_block(seq.discard_start_idx + seq.data.running_query_len) - resumed_blocks
+        block_table = self.block_tables[seq.seq_id]
 
-        # Update seq block ids with the latest access time
-        self._last_access_blocks_tracker.update_seq_blocks_last_access(
-            seq_id, self.block_tables[seq.seq_id].physical_block_ids)
-
-        # Untrack seq
-        self._last_access_blocks_tracker.remove_seq(seq_id)
-        self._computed_blocks_tracker.remove_seq(seq_id)
-
-        # Free table/blocks
-        self.block_tables[seq_id].free()
-        del self.block_tables[seq_id]
-
-    def free_cross(self, seq_group: SequenceGroup) -> None:
-        request_id = seq_group.request_id
-        if request_id not in self.cross_block_tables:
-            # Already freed or hasn't been scheduled yet.
-            return
-        self.cross_block_tables[request_id].free()
-        del self.cross_block_tables[request_id]
-
-    def get_block_table(self, seq: Sequence) -> List[int]:
-        block_ids = self.block_tables[seq.seq_id].physical_block_ids
-        return block_ids  # type: ignore
-
-    def get_cross_block_table(self, seq_group: SequenceGroup) -> List[int]:
-        request_id = seq_group.request_id
-        assert request_id in self.cross_block_tables
-        block_ids = self.cross_block_tables[request_id].physical_block_ids
-        assert all(b is not None for b in block_ids)
-        return block_ids  # type: ignore
-
-    def access_all_blocks_in_seq(self, seq: Sequence, now: float):
-        if self.enable_caching:
-            # Record the latest access time for the sequence. The actual update
-            # of the block ids is deferred to the sequence free(..) call, since
-            # only during freeing of block ids, the blocks are actually added to
-            # the evictor (which is when the most updated time is required)
-            # (This avoids expensive calls to mark_blocks_as_accessed(..))
-            self._last_access_blocks_tracker.update_last_access(
-                seq.seq_id, now)
-
-    def mark_blocks_as_computed(self, seq_group: SequenceGroup,
-                                token_chunk_size: int):
-        # If prefix caching is enabled, mark immutable blocks as computed
-        # right after they have been scheduled (for prefill). This assumes
-        # the scheduler is synchronous so blocks are actually computed when
-        # scheduling the next batch.
-        self.block_allocator.mark_blocks_as_computed([])
-
-    def get_common_computed_block_ids(
-            self, seqs: List[Sequence]) -> GenericSequence[int]:
-        """Determine which blocks for which we skip prefill.
-
-        With prefix caching we can skip prefill for previously-generated blocks.
-        Currently, the attention implementation only supports skipping cached
-        blocks if they are a contiguous prefix of cached blocks.
-
-        This method determines which blocks can be safely skipped for all
-        sequences in the sequence group.
-        """
-        computed_seq_block_ids = []
-        for seq in seqs:
-            computed_seq_block_ids.append(
-                self._computed_blocks_tracker.
-                get_cached_computed_blocks_and_update(
-                    seq.seq_id,
-                    self.block_tables[seq.seq_id].physical_block_ids))
-
-        # NOTE(sang): This assumes seq_block_ids doesn't contain any None.
-        return self.block_allocator.get_common_computed_block_ids(
-            computed_seq_block_ids)  # type: ignore
+        if self.block_sliding_window:
+            raise NotImplementedError("sliding window att not considered")
+        for i in range(num_required_allocation):
+            # The sequence has a new logical block.
+            # Allocate a new physical block.
+            block = self.gpu_allocator.allocate()
+            block_table.insert(resumed_blocks + i, block)
+        return
 
     def fork(self, parent_seq: Sequence, child_seq: Sequence) -> None:
-        if parent_seq.seq_id not in self.block_tables:
-            # Parent sequence has either been freed or never existed.
-            return
+        # NOTE: fork does not allocate a new physical block.
+        # Thus, it is always safe from OOM.
         src_block_table = self.block_tables[parent_seq.seq_id]
-        self.block_tables[child_seq.seq_id] = src_block_table.fork()
+        self.block_tables[child_seq.seq_id] = src_block_table.copy()
+        for block in src_block_table:
+            block.ref_count += 1
 
-        # Track child seq
-        self._computed_blocks_tracker.add_seq(child_seq.seq_id)
-        self._last_access_blocks_tracker.add_seq(child_seq.seq_id)
-
-    def can_swap_in(self, seq_group: SequenceGroup,
-                    num_lookahead_slots: int) -> AllocStatus:
-        """Returns the AllocStatus for the given sequence_group 
-        with num_lookahead_slots.
-
-        Args:
-            sequence_group (SequenceGroup): The sequence group to swap in.
-            num_lookahead_slots (int): Number of lookahead slots used in 
-                speculative decoding, default to 0.
-
-        Returns:
-            AllocStatus: The AllocStatus for the given sequence group.
-        """
-        return self._can_swap(seq_group, Device.GPU, SequenceStatus.SWAPPED,
-                              num_lookahead_slots)
-
-    def swap_in(self, seq_group: SequenceGroup) -> List[Tuple[int, int]]:
-        """Returns the block id mapping (from CPU to GPU) generated by
-        swapping in the given seq_group with num_lookahead_slots.
-
-        Args:
-            seq_group (SequenceGroup): The sequence group to swap in.
-
-        Returns:
-            List[Tuple[int, int]]: The mapping of swapping block from CPU 
-                to GPU.
-        """
-        physical_block_id_mapping = []
-        for seq in seq_group.get_seqs(status=SequenceStatus.SWAPPED):
-            blocks = self.block_tables[seq.seq_id].blocks
-            if len(blocks) == 0:
+    def _get_physical_blocks(
+            self, seq_group: SequenceGroup) -> List[PhysicalTokenBlock]:
+        # NOTE: Here, we assume that the physical blocks are only shared by
+        # the sequences in the same group.
+        blocks: Set[PhysicalTokenBlock] = set()
+        for seq in seq_group.get_seqs():
+            if seq.is_finished():
                 continue
+            blocks.update(self.block_tables[seq.seq_id])
+        return list(blocks)
+    
+    def get_seq_blocks_by_device(
+            self, seq_group: SequenceGroup, device: Device) -> List[PhysicalTokenBlock]:
+        blocks = [b for b in self._get_physical_blocks(seq_group) if b.device == device]
+        return blocks
 
-            seq_swap_mapping = self.block_allocator.swap(blocks=blocks,
-                                                         src_device=Device.CPU,
-                                                         dst_device=Device.GPU)
+    # NOTE: consider swapped blocks and required new blocks in this function
+    # NOTE: do not use this for resuming paused seqs because it assumes adding new query only
+    # use required_resume_blocks instead
+    def can_swap_in(self, seq_group: SequenceGroup, max_swap_blocks: int = -1, inflight_tokens: int = -1) -> bool:
+        blocks = self.get_seq_blocks_by_device(seq_group, Device.CPU)
+        num_required_blocks = len(blocks) if max_swap_blocks == -1 else min(len(blocks), max_swap_blocks) 
+        num_required_blocks += self.required_new_blocks(seq_group, inflight_tokens)
+        num_free_blocks = self.gpu_allocator.get_num_free_blocks()
+        return num_free_blocks - num_required_blocks >= self.watermark_blocks
+    
+    # NOTE: consider swapped blocks and discarded blocks in this function
+    def required_resume_blocks(self, seq_group: SequenceGroup, max_swap_blocks: int = -1, inflight_tokens: int = -1) -> int:
+        blocks = self.get_seq_blocks_by_device(seq_group, Device.CPU)
+        num_required_blocks = len(blocks) if max_swap_blocks == -1 else min(len(blocks), max_swap_blocks) 
+        for seq in seq_group.get_seqs(status=SequenceStatus.RESUMING):
+            if inflight_tokens == -1:
+                assert seq.discard_start_idx == 0
+                required_allocation = self.token_2_block(seq.discard_length)
+            else:
+                required_allocation = self.token_2_block(seq.discard_start_idx + inflight_tokens) -\
+                                      self.token_2_block(seq.discard_start_idx)
+            num_required_blocks += required_allocation
+        return num_required_blocks
 
-            # Refresh the block ids of the table (post-swap)
-            self.block_tables[seq.seq_id].update(blocks)
+    def swap_in(self, seq_group: SequenceGroup, max_num_blocks = -1, status=SequenceStatus.SWAPPED) -> Dict[int, int]:
+        # CPU block -> GPU block.
+        mapping: Dict[PhysicalTokenBlock, PhysicalTokenBlock] = {}
+        for seq in seq_group.get_seqs(status=status):
+            new_block_table: BlockTable = []
+            block_table = self.block_tables[seq.seq_id]
 
-            seq_physical_block_id_mapping = {
-                self.block_allocator.get_physical_block_id(
-                    Device.CPU, cpu_block_id):
-                self.block_allocator.get_physical_block_id(
-                    Device.GPU, gpu_block_id)
-                for cpu_block_id, gpu_block_id in seq_swap_mapping.items()
-            }
+            for block in block_table:
+                if block.device == Device.GPU or max_num_blocks == 0:
+                    new_block_table.append(block)
+                    continue
+                if block in mapping:
+                    gpu_block = mapping[block]
+                    gpu_block.ref_count += 1
+                else:
+                    gpu_block = self.gpu_allocator.allocate()
+                    mapping[block] = gpu_block
+                    max_num_blocks -= 1
+                new_block_table.append(gpu_block)
+                # Free the CPU block swapped in to GPU.
+                self.cpu_allocator.free(block)
+            self.block_tables[seq.seq_id] = new_block_table
 
-            physical_block_id_mapping.extend(
-                list(seq_physical_block_id_mapping.items()))
+        block_number_mapping = {
+            cpu_block.block_number: gpu_block.block_number
+            for cpu_block, gpu_block in mapping.items()
+        }
+        return block_number_mapping
 
-        return physical_block_id_mapping
+    def can_swap_out(self, seq_group: SequenceGroup, first_n_blocks = -1) -> bool:
+        blocks = self.get_seq_blocks_by_device(seq_group, Device.GPU)
+        required_blocks = len(blocks)
+        if first_n_blocks != -1:
+            required_blocks = min(first_n_blocks, required_blocks)
+        return required_blocks <= self.cpu_allocator.get_num_free_blocks()
 
-    def can_swap_out(self, seq_group: SequenceGroup) -> bool:
-        """Returns whether we can swap out the given sequence_group 
-        with num_lookahead_slots.
+    # swap out first n blocks, -1 means whole sequence
+    def swap_out(self, seq_group: SequenceGroup, first_n_blocks = -1, status=SequenceStatus.RUNNING) -> Tuple[Dict[int, int], bool]:
+        # GPU block -> CPU block.
+        all_swapped_out = True
+        mapping: Dict[PhysicalTokenBlock, PhysicalTokenBlock] = {}
+        for seq in seq_group.get_seqs(status=status):
+            new_block_table: BlockTable = []
+            block_table = self.block_tables[seq.seq_id]
 
-        Args:
-            seq_group (SequenceGroup): The sequence group to swap in.
-            num_lookahead_slots (int): Number of lookahead slots used in 
-                speculative decoding, default to 0.
+            for block in block_table:
+                if block.device == Device.CPU or first_n_blocks == 0:
+                    new_block_table.append(block)
+                    if block.device == Device.GPU:
+                        all_swapped_out = False
+                    continue
+                if block in mapping:
+                    cpu_block = mapping[block]
+                    cpu_block.ref_count += 1
+                else:
+                    cpu_block = self.cpu_allocator.allocate()
+                    mapping[block] = cpu_block
+                    first_n_blocks -= 1
+                new_block_table.append(cpu_block)
+                # Free the GPU block swapped out to CPU.
+                self.gpu_allocator.free(block)
+            self.block_tables[seq.seq_id] = new_block_table
 
-        Returns:
-            bool: Whether it's possible to swap out current sequence group.
-        """
-        alloc_status = self._can_swap(seq_group, Device.CPU,
-                                      SequenceStatus.RUNNING)
-        return alloc_status == AllocStatus.OK
-
-    def swap_out(self, seq_group: SequenceGroup) -> List[Tuple[int, int]]:
-        """Returns the block id mapping (from GPU to CPU) generated by
-        swapping out the given sequence_group with num_lookahead_slots.
-
-        Args:
-            sequence_group (SequenceGroup): The sequence group to swap in.
-
-        Returns:
-            List[Tuple[int, int]]: The mapping of swapping block from 
-                GPU to CPU.
-        """
-        physical_block_id_mapping = []
-        for seq in seq_group.get_seqs(status=SequenceStatus.RUNNING):
-            blocks = self.block_tables[seq.seq_id].blocks
-            if len(blocks) == 0:
+        block_number_mapping = {
+            gpu_block.block_number: cpu_block.block_number
+            for gpu_block, cpu_block in mapping.items()
+        }
+        return block_number_mapping, all_swapped_out
+    
+    # swap out first n blocks, -1 means whole sequence
+    def swap_out_from_back(
+        self, 
+        seq: Sequence, 
+        num_swap: int,
+        blocks_to_swap_out: Dict[int, int]
+    ):
+        # GPU block -> CPU block.
+        block_table = self.block_tables[seq.seq_id]
+        mapping: Dict[PhysicalTokenBlock, PhysicalTokenBlock] = {}
+        for i in range(len(block_table)-1, -1, -1):
+            block = block_table[i]
+            if block.device == Device.CPU or num_swap == 0:
                 continue
+            if block in mapping:
+                cpu_block = mapping[block]
+                cpu_block.ref_count += 1
+            else:
+                cpu_block = self.cpu_allocator.allocate()
+                mapping[block] = cpu_block
+                block_table[i] = cpu_block
+                num_swap -= 1
+            self.gpu_allocator.free(block)
+        block_number_mapping = {
+            gpu_block.block_number: cpu_block.block_number
+            for gpu_block, cpu_block in mapping.items()
+        }
+        blocks_to_swap_out.update(block_number_mapping)
+        return
 
-            seq_swap_mapping = self.block_allocator.swap(blocks=blocks,
-                                                         src_device=Device.GPU,
-                                                         dst_device=Device.CPU)
+    def _free_block_table(self, block_table: BlockTable) -> None:
+        for block in set(block_table):
+            if block.device == Device.GPU:
+                self.gpu_allocator.free(block)
+            else:
+                self.cpu_allocator.free(block)
 
-            # Refresh the block ids of the table (post-swap)
-            self.block_tables[seq.seq_id].update(blocks)
+    def _free_blocks(self, seq, num_blocks: int, block_table: BlockTable) -> int:
+        cnt = 0
+        remove_blocks = []
+        for block in block_table:
+            if block.device == Device.GPU: 
+                if cnt < num_blocks:
+                    self.gpu_allocator.free(block)
+                    cnt += 1
+                    remove_blocks.append(block)
+                else: break
+            else:
+                if cnt < num_blocks:
+                    self.cpu_allocator.free(block)
+                    cnt += 1
+                    remove_blocks.append(block)
+                else: break
+        for blk in remove_blocks:
+            block_table.remove(blk) 
+        if len(block_table) == 0:
+            self.free(seq)
+        return cnt
 
-            seq_physical_block_id_mapping = {
-                self.block_allocator.get_physical_block_id(
-                    Device.GPU, gpu_block_id):
-                self.block_allocator.get_physical_block_id(
-                    Device.CPU, cpu_block_id)
-                for gpu_block_id, cpu_block_id in seq_swap_mapping.items()
-            }
+    def free(self, seq: Sequence) -> None:
+        if seq.seq_id not in self.block_tables:
+            # Already freed or haven't been scheduled yet.
+            return
+        block_table = self.block_tables[seq.seq_id]
+        self._free_block_table(block_table)
+        del self.block_tables[seq.seq_id]
 
-            physical_block_id_mapping.extend(
-                list(seq_physical_block_id_mapping.items()))
+    def free_fst_blk_tokens(self, seq: Sequence, num_blocks) -> None:
+        block_table = self.block_tables[seq.seq_id] 
+        return self._free_blocks(seq, num_blocks, block_table)
 
-        return physical_block_id_mapping
+
+    def reset(self) -> None:
+        for block_table in self.block_tables.values():
+            self._free_block_table(block_table)
+        self.block_tables.clear()
+
+    def get_block_table(self, seq: Sequence) -> List[int]:
+        block_table = self.block_tables[seq.seq_id]
+        return [block.block_number for block in block_table]
 
     def get_num_free_gpu_blocks(self) -> int:
-        return self.block_allocator.get_num_free_blocks(Device.GPU)
+        return self.gpu_allocator.get_num_free_blocks()
 
     def get_num_free_cpu_blocks(self) -> int:
-        return self.block_allocator.get_num_free_blocks(Device.CPU)
-
-    def get_prefix_cache_hit_rate(self, device: Device) -> float:
-        return self.block_allocator.get_prefix_cache_hit_rate(device)
-
-    def _can_swap(self,
-                  seq_group: SequenceGroup,
-                  device: Device,
-                  status: SequenceStatus,
-                  num_lookahead_slots: int = 0) -> AllocStatus:
-        """Returns the AllocStatus for swapping in/out the given sequence_group 
-        on to the 'device'.
-
-        Args:
-            sequence_group (SequenceGroup): The sequence group to swap in.
-            device (Device): device to swap the 'seq_group' on.
-            status (SequenceStatus): The status of sequence which is needed
-                for action. RUNNING for swap out and SWAPPED for swap in
-            num_lookahead_slots (int): Number of lookahead slots used in 
-                speculative decoding, default to 0.
-
-        Returns:
-            AllocStatus: The AllocStatus for swapping in/out the given 
-                sequence_group on to the 'device'.
-        """
-        # First determine the number of blocks that will be touched by this
-        # swap. Then verify if there are available blocks in the device
-        # to perform the swap.
-        num_blocks_touched = 0
-        blocks: List[Block] = []
-        for seq in seq_group.get_seqs(status=status):
-            block_table = self.block_tables[seq.seq_id]
-            if block_table.blocks is not None:
-                # Compute the number blocks to touch for the tokens to be
-                # appended. This does NOT include the full blocks that need
-                # to be touched for the swap.
-                num_blocks_touched += \
-                    block_table.get_num_blocks_touched_by_append_slots(
-                        block_table.get_unseen_token_ids(seq.get_token_ids()),
-                        num_lookahead_slots=num_lookahead_slots)
-                blocks.extend(block_table.blocks)
-        # Compute the number of full blocks to touch and add it to the
-        # existing count of blocks to touch.
-        num_blocks_touched += self.block_allocator.get_num_full_blocks_touched(
-            blocks, device=device)
-
-        watermark_blocks = 0
-        if device == Device.GPU:
-            watermark_blocks = self.watermark_blocks
-
-        if self.block_allocator.get_num_total_blocks(
-                device) < num_blocks_touched:
-            return AllocStatus.NEVER
-        elif self.block_allocator.get_num_free_blocks(
-                device) - num_blocks_touched >= watermark_blocks:
-            return AllocStatus.OK
-        else:
-            return AllocStatus.LATER
+        return self.cpu_allocator.get_num_free_blocks()

@@ -17,36 +17,36 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Inference-only BaiChuan model compatible with HuggingFace weights."""
+"""Inference-only BaiChuan model compatible with HuggingFace weights.
+
+The input of the model is flattened to a 1D tensor of tokens. The model uses
+InputMetadata to extract the original 2D shape of the input.
+"""
 import math
-from typing import Iterable, List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Dict
 
 import torch
 from torch import nn
-from transformers import PretrainedConfig
 
-from vllm.attention import Attention, AttentionMetadata
-from vllm.config import CacheConfig, LoRAConfig
-from vllm.distributed import (get_pp_group, get_tensor_model_parallel_rank,
-                              get_tensor_model_parallel_world_size)
+from vllm.model_executor.input_metadata import InputMetadata
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.linear import (MergedColumnParallelLinear,
-                                               QKVParallelLinear,
-                                               RowParallelLinear)
-from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.model_executor.layers.rotary_embedding import get_rope
-from vllm.model_executor.layers.sampler import Sampler, SamplerOutput
-from vllm.model_executor.layers.vocab_parallel_embedding import (
-    ParallelLMHead, VocabParallelEmbedding)
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.sampling_metadata import SamplingMetadata
-from vllm.sequence import IntermediateTensors
+from vllm.model_executor.layers.attention import (PagedAttentionWithRoPE,
+                                                  PagedAttentionWithALiBi)
+from vllm.model_executor.layers.sampler import Sampler
+from vllm.model_executor.weight_utils import (
+    convert_pyslice_to_tensor, hf_model_weights_iterator,
+    load_padded_tensor_parallel_vocab, load_tensor_parallel_weights)
+from vllm.model_executor.parallel_utils.parallel_state import (
+    get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size)
+from vllm.model_executor.parallel_utils.layers import (VocabParallelEmbedding,
+                                                       ColumnParallelLinear,
+                                                       RowParallelLinear)
+from vllm.sequence import SamplerOutput
+from vllm.worker.cache_engine import CacheEngine
+from vllm.transformers_utils.configs.baichuan import BaiChuanConfig
 
-from .interfaces import SupportsLoRA, SupportsPP
-from .utils import (is_pp_missing_parameter,
-                    make_empty_intermediate_tensors_factory, make_layers)
+KVCache = Tuple[torch.Tensor, torch.Tensor]
 
 
 def _get_alibi_slopes(total_num_heads: int) -> torch.Tensor:
@@ -81,17 +81,20 @@ class BaiChuanMLP(nn.Module):
         hidden_size: int,
         intermediate_size: int,
         hidden_act: str,
-        quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
-        self.gate_up_proj = MergedColumnParallelLinear(
-            hidden_size, [intermediate_size] * 2,
+        self.gate_up_proj = ColumnParallelLinear(
+            hidden_size,
+            2 * intermediate_size,
             bias=False,
-            quant_config=quant_config)
-        self.down_proj = RowParallelLinear(intermediate_size,
-                                           hidden_size,
-                                           bias=False,
-                                           quant_config=quant_config)
+            gather_output=False,
+        )
+        self.down_proj = RowParallelLinear(
+            intermediate_size,
+            hidden_size,
+            bias=False,
+            input_is_parallel=True,
+        )
         if hidden_act != "silu":
             raise ValueError(f"Unsupported activation: {hidden_act}. "
                              "Only silu is supported for now.")
@@ -114,8 +117,6 @@ class BaiChuanAttention(nn.Module):
         position_embedding: str,
         rope_theta: float = 10000,
         max_position_embeddings: int = 8192,
-        cache_config: Optional[CacheConfig] = None,
-        quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -131,19 +132,17 @@ class BaiChuanAttention(nn.Module):
         self.max_position_embeddings = max_position_embeddings
 
         # pylint: disable=invalid-name
-        self.W_pack = QKVParallelLinear(
+        self.W_pack = ColumnParallelLinear(
             hidden_size,
-            self.head_dim,
-            self.total_num_heads,
-            self.total_num_heads,
+            3 * hidden_size,
             bias=False,
-            quant_config=quant_config,
+            gather_output=False,
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=False,
-            quant_config=quant_config,
+            input_is_parallel=True,
         )
         # Create the alibi slopes and slice them.
         if self.postion_embedding == "ALIBI":
@@ -154,48 +153,43 @@ class BaiChuanAttention(nn.Module):
             alibi_slopes = alibi_slopes[head_start:head_end].tolist()
 
             scaling = self.head_dim**-0.5
-            self.attn = Attention(self.num_heads,
-                                  self.head_dim,
-                                  scaling,
-                                  alibi_slopes=alibi_slopes,
-                                  quant_config=quant_config)
+            self.attn = PagedAttentionWithALiBi(self.num_heads, self.head_dim,
+                                                scaling, alibi_slopes)
         else:
-            self.rotary_emb = get_rope(
-                self.head_dim,
-                rotary_dim=self.head_dim,
-                max_position=self.max_position_embeddings,
-                base=self.rope_theta,
-            )
             self.scaling = self.head_dim**-0.5
-            self.attn = Attention(self.num_heads,
-                                  self.head_dim,
-                                  self.scaling,
-                                  cache_config=cache_config,
-                                  quant_config=quant_config)
+            self.attn = PagedAttentionWithRoPE(
+                self.num_heads,
+                self.head_dim,
+                self.scaling,
+                rotary_dim=self.head_dim,
+                base=self.rope_theta,
+                max_position=self.max_position_embeddings)
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        kv_cache: torch.Tensor,
-        attn_metadata: AttentionMetadata,
+        kv_cache: KVCache,
+        input_metadata: InputMetadata,
+        cache_event: Optional[torch.cuda.Event],
     ) -> torch.Tensor:
         qkv, _ = self.W_pack(hidden_states)
         q, k, v = qkv.chunk(chunks=3, dim=-1)
-        if self.postion_embedding != "ALIBI":
-            q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v, kv_cache, attn_metadata)
+        k_cache, v_cache = kv_cache
+        if self.postion_embedding == "ALIBI":
+            attn_output = self.attn(q, k, v, k_cache, v_cache, input_metadata,
+                                    cache_event)
+        else:
+            attn_output = self.attn(positions, q, k, v, k_cache, v_cache,
+                                    input_metadata, cache_event)
+
         output, _ = self.o_proj(attn_output)
         return output
 
 
 class BaiChuanDecoderLayer(nn.Module):
 
-    def __init__(self,
-                 config: PretrainedConfig,
-                 position_embedding: str,
-                 cache_config: Optional[CacheConfig] = None,
-                 quant_config: Optional[QuantizationConfig] = None):
+    def __init__(self, config: BaiChuanConfig, position_embedding: str):
         super().__init__()
         self.hidden_size = config.hidden_size
         rope_theta = getattr(config, "rope_theta", 10000)
@@ -207,14 +201,11 @@ class BaiChuanDecoderLayer(nn.Module):
             position_embedding=position_embedding,
             rope_theta=rope_theta,
             max_position_embeddings=max_position_embeddings,
-            cache_config=cache_config,
-            quant_config=quant_config,
         )
         self.mlp = BaiChuanMLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
-            quant_config=quant_config,
         )
         self.input_layernorm = RMSNorm(config.hidden_size,
                                        eps=config.rms_norm_eps)
@@ -225,39 +216,33 @@ class BaiChuanDecoderLayer(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        kv_cache: torch.Tensor,
-        attn_metadata: AttentionMetadata,
-        residual: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        kv_cache: KVCache,
+        input_metadata: InputMetadata,
+        cache_event: Optional[torch.cuda.Event],
+    ) -> torch.Tensor:
         # Self Attention
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(
-                hidden_states, residual)
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             kv_cache=kv_cache,
-            attn_metadata=attn_metadata,
+            input_metadata=input_metadata,
+            cache_event=cache_event,
         )
+        hidden_states = residual + hidden_states
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(
-            hidden_states, residual)
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
-        return hidden_states, residual
+        hidden_states = residual + hidden_states
+        return hidden_states
 
 
 class BaiChuanModel(nn.Module):
 
-    def __init__(self,
-                 config: PretrainedConfig,
-                 position_embedding: str,
-                 cache_config: Optional[CacheConfig] = None,
-                 quant_config: Optional[QuantizationConfig] = None,
-                 prefix: str = ""):
+    def __init__(self, config: BaiChuanConfig, position_embedding: str):
         super().__init__()
         self.config = config
         self.padding_idx = config.pad_token_id
@@ -267,197 +252,151 @@ class BaiChuanModel(nn.Module):
             config.vocab_size,
             config.hidden_size,
         )
-        self.start_layer, self.end_layer, self.layers = make_layers(
-            config.num_hidden_layers,
-            lambda prefix: BaiChuanDecoderLayer(config, position_embedding,
-                                                cache_config, quant_config),
-            prefix=f"{prefix}.layers",
-        )
+        self.layers = nn.ModuleList([
+            BaiChuanDecoderLayer(config, position_embedding)
+            for _ in range(config.num_hidden_layers)
+        ])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.make_empty_intermediate_tensors = (
-            make_empty_intermediate_tensors_factory(
-                ["hidden_states", "residual"], config.hidden_size))
 
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        kv_caches: List[torch.Tensor],
-        attn_metadata: AttentionMetadata,
-        intermediate_tensors: Optional[IntermediateTensors],
-    ) -> Union[torch.Tensor, IntermediateTensors]:
-        if get_pp_group().is_first_rank:
-            hidden_states = self.embed_tokens(input_ids)
-            residual = None
-        else:
-            assert intermediate_tensors is not None
-            hidden_states = intermediate_tensors["hidden_states"]
-            residual = intermediate_tensors["residual"]
-        for i in range(self.start_layer, self.end_layer):
+        kv_caches: List[KVCache],
+        input_metadata: InputMetadata,
+        cache_events: Optional[List[torch.cuda.Event]],
+        cache_engine: CacheEngine,
+        blocks_to_swap_in: Dict[int, int],
+        blocks_to_swap_out: Dict[int, int],
+    ) -> torch.Tensor:
+        hidden_states = self.embed_tokens(input_ids)
+        for i in range(len(self.layers)):
+            cache_event = None
+            if cache_events is None:
+                if blocks_to_swap_out:
+                    cache_engine._swap_by_layer(cache_engine.gpu_cache, cache_engine.cpu_cache, blocks_to_swap_out, i)
+                    cache_event = cache_engine.events[i]
+                if blocks_to_swap_in:
+                    cache_engine._swap_by_layer(cache_engine.cpu_cache, cache_engine.gpu_cache, blocks_to_swap_in, i)
+                    cache_event = cache_engine.events[i]
+            else:
+                cache_event = cache_events[i]
             layer = self.layers[i]
-            hidden_states, residual = layer(
+            hidden_states = layer(
                 positions,
                 hidden_states,
-                kv_caches[i - self.start_layer],
-                attn_metadata,
-                residual,
+                kv_caches[i],
+                input_metadata,
+                cache_event,
             )
-        if not get_pp_group().is_last_rank:
-            return IntermediateTensors({
-                "hidden_states": hidden_states,
-                "residual": residual,
-            })
-        hidden_states, _ = self.norm(hidden_states, residual)
+        hidden_states = self.norm(hidden_states)
         return hidden_states
 
 
-class BaiChuanBaseForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
-    packed_modules_mapping = {
-        "W_pack": ["W_pack"],
-        "gate_up_proj": [
-            "gate_proj",
-            "up_proj",
-        ],
-    }
-    # LoRA specific attributes
-    supported_lora_modules = [
-        "W_pack",
-        "o_proj",
-        "gate_up_proj",
-        "down_proj",
-    ]
-    embedding_modules = {}
-    embedding_padding_modules = []
+class BaiChuanBaseForCausalLM(nn.Module):
 
-    def __init__(
-        self,
-        config: PretrainedConfig,
-        position_embedding: str,
-        cache_config: Optional[CacheConfig] = None,
-        quant_config: Optional[QuantizationConfig] = None,
-        lora_config: Optional[LoRAConfig] = None,
-    ):
+    def __init__(self, config, position_embedding: str):
         super().__init__()
-
         self.config = config
-        self.lora_config = lora_config
-
-        self.quant_config = quant_config
-        self.model = BaiChuanModel(config, position_embedding, cache_config,
-                                   quant_config)
-        self.lm_head = ParallelLMHead(config.vocab_size,
-                                      config.hidden_size,
-                                      quant_config=quant_config)
-        if self.config.tie_word_embeddings:
-            self.lm_head.weight = self.model.embed_tokens.weight
-        self.logits_processor = LogitsProcessor(config.vocab_size)
-        self.sampler = Sampler()
-        self.make_empty_intermediate_tensors = (
-            self.model.make_empty_intermediate_tensors)
+        self.model = BaiChuanModel(config, position_embedding)
+        self.lm_head = ColumnParallelLinear(
+            config.hidden_size,
+            config.vocab_size,
+            bias=False,
+            gather_output=False,
+        )
+        self.sampler = Sampler(config.vocab_size)
 
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        kv_caches: List[torch.Tensor],
-        attn_metadata: AttentionMetadata,
-        intermediate_tensors: Optional[IntermediateTensors] = None,
-    ) -> Union[torch.Tensor, IntermediateTensors]:
+        kv_caches: List[KVCache],
+        input_metadata: InputMetadata,
+        cache_events: Optional[List[torch.cuda.Event]],
+        cache_engine: CacheEngine=None,
+        blocks_to_swap_in: Dict[int, int]={},
+        blocks_to_swap_out: Dict[int, int]={},
+    ) -> SamplerOutput:
         hidden_states = self.model(input_ids, positions, kv_caches,
-                                   attn_metadata, intermediate_tensors)
-        return hidden_states
-
-    def compute_logits(
-        self,
-        hidden_states: torch.Tensor,
-        sampling_metadata: SamplingMetadata,
-    ) -> Optional[torch.Tensor]:
-        logits = self.logits_processor(self.lm_head, hidden_states,
-                                       sampling_metadata)
-        return logits
-
-    def sample(
-        self,
-        logits: torch.Tensor,
-        sampling_metadata: SamplingMetadata,
-    ) -> Optional[SamplerOutput]:
-        next_tokens = self.sampler(logits, sampling_metadata)
+                                   input_metadata, cache_events, cache_engine, blocks_to_swap_in, blocks_to_swap_out)
+        next_tokens = self.sampler(self.lm_head.weight, hidden_states,
+                                   input_metadata)
         return next_tokens
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
-        params_dict = dict(self.named_parameters())
-        for name, loaded_weight in weights:
+    _column_parallel_weights = []
+    _row_parallel_weights = ["o_proj.weight", "down_proj.weight"]
+
+    def load_weights(self,
+                     model_name_or_path: str,
+                     cache_dir: Optional[str] = None,
+                     load_format: str = "auto",
+                     revision: Optional[str] = None):
+        tp_world_size = get_tensor_model_parallel_world_size()
+        tp_rank = get_tensor_model_parallel_rank()
+        state_dict = self.state_dict()
+
+        for name, loaded_weight in hf_model_weights_iterator(
+                model_name_or_path, cache_dir, load_format, revision):
             if "rotary_emb.inv_freq" in name:
                 continue
-            if name == "lm_head.weight":
-                # Unlike Baichuan, Baichuan2 normalizes the head weights.
-                # Refer to:
-                # https://huggingface.co/baichuan-inc/Baichuan2-7B-Chat/blob/84603cde5ebffb6084e476cfaeceaf0b8b91fe54/modeling_baichuan.py#L508
-                # Distinguish between Baichuan and Baichuan2 by checking the
-                # vocab size. This is suggested by
-                # https://github.com/vllm-project/vllm/pull/1022#discussion_r1325652704
-                is_baichuan2 = self.config.vocab_size == 125696
-                if is_baichuan2:
-                    loaded_weight = torch.nn.functional.normalize(
-                        loaded_weight)
 
-            for (param_name, weight_name, shard_id) in stacked_params_mapping:
+            loaded_weight = convert_pyslice_to_tensor(loaded_weight)
+
+            if "W_pack" in name:
+                total_num_heads = self.config.num_attention_heads
+                hidden_size = self.config.hidden_size
+                head_size = hidden_size // total_num_heads
+                num_heads = total_num_heads // tp_world_size
+                head_start = tp_rank * num_heads
+                head_end = (tp_rank + 1) * num_heads
+
+                loaded_weight = loaded_weight.view(3, total_num_heads,
+                                                   head_size, hidden_size)
+                loaded_weight = loaded_weight[:, head_start:head_end, :, :]
+                loaded_weight = loaded_weight.reshape(-1, hidden_size)
+
+            is_gate_up_weight = False
+            for stride_id, weight_name in enumerate(["gate_proj", "up_proj"]):
                 if weight_name not in name:
                     continue
-                name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                if is_pp_missing_parameter(name, self):
-                    continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
+                param = state_dict[name.replace(weight_name, "gate_up_proj")]
+                shard_size = param.shape[0] // 2
+                loaded_weight = loaded_weight[shard_size * tp_rank:shard_size *
+                                              (tp_rank + 1)]
+                param_slice = param.data[shard_size * stride_id:shard_size *
+                                         (stride_id + 1)]
+                assert param_slice.shape == loaded_weight.shape
+                param_slice.copy_(loaded_weight)
+                is_gate_up_weight = True
                 break
-            else:
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                if is_pp_missing_parameter(name, self):
-                    continue
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader",
-                                        default_weight_loader)
-                weight_loader(param, loaded_weight)
+            if is_gate_up_weight:
+                continue
+
+            param = state_dict[name]
+
+            if "embed_tokens" in name or "lm_head" in name:
+                load_padded_tensor_parallel_vocab(param, loaded_weight,
+                                                  tp_rank)
+                continue
+
+            load_tensor_parallel_weights(
+                param,
+                loaded_weight,
+                name,
+                self._column_parallel_weights,
+                self._row_parallel_weights,
+                tp_rank,
+            )
 
 
-class BaichuanForCausalLM(BaiChuanBaseForCausalLM):
-    """Baichuan 13B and Baichuan2 7B/13B."""
+class BaichuanForCausalLM(BaiChuanBaseForCausalLM):  # baichuan 13b
 
-    def __init__(
-        self,
-        config: PretrainedConfig,
-        cache_config: Optional[CacheConfig] = None,
-        quant_config: Optional[QuantizationConfig] = None,
-        lora_config: Optional[LoRAConfig] = None,
-    ):
-        if config.hidden_size == 4096:  # baichuan2 7b
-            super().__init__(config, "ROPE", cache_config, quant_config,
-                             lora_config)
-        else:  # baichuan 13b, baichuan2 13b
-            super().__init__(config, "ALIBI", cache_config, quant_config,
-                             lora_config)
+    def __init__(self, config):
+        super().__init__(config, "ALIBI")
 
 
-class BaiChuanForCausalLM(BaiChuanBaseForCausalLM):
-    """Baichuan 7B."""
+class BaiChuanForCausalLM(BaiChuanBaseForCausalLM):  # baichuan 7b
 
-    def __init__(
-        self,
-        config: PretrainedConfig,
-        cache_config: Optional[CacheConfig] = None,
-        quant_config: Optional[QuantizationConfig] = None,
-        lora_config: Optional[LoRAConfig] = None,
-    ):
-        super().__init__(config, "ROPE", cache_config, quant_config,
-                         lora_config)
+    def __init__(self, config):
+        super().__init__(config, "ROPE")
